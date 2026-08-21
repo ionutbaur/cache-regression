@@ -1,62 +1,30 @@
 # cache-regression
 
-This project uses Quarkus, the Supersonic Subatomic Java Framework.
+A minimal reproduction for a Quarkus Cache regression where `@CacheResult` on a `Uni`-returning method incorrectly **caches failures** when `runSubscriptionOn` is used to offload blocking I/O to a worker thread.
 
-If you want to learn more about Quarkus, please visit its website: <https://quarkus.io/>.
+- Passes on Quarkus **3.19.4**
+- Fails on Quarkus **3.38.3**
 
-## Running the application in dev mode
+## The bug
 
-You can run your application in dev mode that enables live coding using:
+When a `@CacheResult`-annotated method returns a `Uni` that uses `runSubscriptionOn(...)`, a failed `Uni` leaves its backing `CompletableFuture` in the Caffeine cache. Subsequent calls retrieve the same failed future instead of retrying, violating the documented behaviour that failures must not be cached.
 
-```shell script
-./mvnw quarkus:dev
+The test `getUserAttributes_notCached_whenErrors` demonstrates this: the second call should throw a fresh "Second call LDAP error" but instead re-throws "First call LDAP error" from the cached failed future.
+
+## Probably root cause (AI-assisted)
+
+`CaffeineCacheImpl.getAsync()` stores the `CompletableFuture` in the Caffeine map via `cache.asMap().computeIfAbsent()`. Caffeine registers a `whenComplete` cleanup callback to remove the entry on failure, but this fires asynchronously on the worker thread **after** `runSubscriptionOn` offloads execution. There is a race: the calling thread's `.await().indefinitely()` can unblock and make a second call before the cleanup callback has run, finding the still-present failed future.
+
+Without `runSubscriptionOn` the future completes synchronously inside `computeIfAbsent`, so Caffeine's cleanup runs before the method returns — no race. However, removing `runSubscriptionOn` is not a viable production fix because the underlying LDAP call is blocking I/O that must not run on the Quarkus event loop.
+
+The synchronous `get()` path in `CaffeineCacheImpl` handles failures correctly by explicitly calling `cache.asMap().remove(key, newCacheValue)` — `getAsync()` lacks the equivalent.
+
+This is a regression of [#51928](https://github.com/quarkusio/quarkus/issues/51928), which was fixed in 3.27.4.
+
+## Reproducing
+
+```shell
+./mvnw test
 ```
 
-> **_NOTE:_**  Quarkus now ships with a Dev UI, which is available in dev mode only at <http://localhost:8080/q/dev/>.
-
-## Packaging and running the application
-
-The application can be packaged using:
-
-```shell script
-./mvnw package
-```
-
-It produces the `quarkus-run.jar` file in the `target/quarkus-app/` directory.
-Be aware that it’s not an _über-jar_ as the dependencies are copied into the `target/quarkus-app/lib/` directory.
-
-The application is now runnable using `java -jar target/quarkus-app/quarkus-run.jar`.
-
-If you want to build an _über-jar_, execute the following command:
-
-```shell script
-./mvnw package -Dquarkus.package.jar.type=uber-jar
-```
-
-The application, packaged as an _über-jar_, is now runnable using `java -jar target/*-runner.jar`.
-
-## Creating a native executable
-
-You can create a native executable using:
-
-```shell script
-./mvnw package -Dnative
-```
-
-Or, if you don't have GraalVM installed, you can run the native executable build in a container using:
-
-```shell script
-./mvnw package -Dnative -Dquarkus.native.container-build=true
-```
-
-You can then execute your native executable with: `./target/cache-regression-1.0.0-SNAPSHOT-runner`
-
-If you want to learn more about building native executables, please consult <https://quarkus.io/guides/maven-tooling>.
-
-## Provided Code
-
-### REST
-
-Easily start your REST Web Services
-
-[Related guide section...](https://quarkus.io/guides/getting-started-reactive#reactive-jax-rs-resources)
+The test `MockLdapServiceTest#getUserAttributes_notCached_whenErrors` fails. Switch to Quarkus 3.19.4 (the commented-out version in `pom.xml`) to confirm it passes.
